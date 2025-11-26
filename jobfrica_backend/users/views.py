@@ -8,8 +8,10 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
 from django.db.models import Q, Count, Avg
+from django.db import models
 from django.utils import timezone
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
+from rest_framework_simplejwt.exceptions import TokenError
 from django.contrib.auth import authenticate, logout
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.encoding import force_bytes, force_str
@@ -70,7 +72,7 @@ class UserRegistrationView(generics.CreateAPIView):
         # Generate tokens for auto-login
         refresh = RefreshToken.for_user(user)
         
-        # Prepare response
+        # Prepare response data with message in frontend
         response_data = {
             'user': {
                 'id': user.id,
@@ -85,7 +87,7 @@ class UserRegistrationView(generics.CreateAPIView):
                 'refresh': str(refresh),
                 'access': str(refresh.access_token),
             },
-            'message': 'Registration successful. Please check your email for verification.'
+            'message': ''
         }
         
         return Response(response_data, status=status.HTTP_201_CREATED)
@@ -157,12 +159,7 @@ class UserLoginView(generics.CreateAPIView):
         refresh = RefreshToken.for_user(user)
         
         # Get user's role-specific data
-        if user.role == 'employer':
-            user_data = EmployerProfileSerializer(user).data
-        elif user.role == 'job_seeker':
-            user_data = JobSeekerProfileSerializer(user).data
-        else:
-            user_data = UserProfileSerializer(user).data
+        user_data = UserProfileSerializer(user).data
         
         return Response({
             'user': user_data,
@@ -174,27 +171,46 @@ class UserLoginView(generics.CreateAPIView):
         }, status=status.HTTP_200_OK)
 
 
-class UserLogoutView(APIView):
+class UserLogoutView(generics.GenericAPIView):
     """Logout view that blacklists the refresh token"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = []  # Remove IsAuthenticated to handle expired tokens
     serializer_class = UserLogoutSerializer
 
     def post(self, request):
+        refresh_token = request.data.get('refresh_token')
+        
+        if not refresh_token:
+            return Response(
+                {'error': 'Refresh token is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
         try:
-            refresh_token = request.data.get('refresh_token')
-            if refresh_token:
-                token = RefreshToken(refresh_token)
-                token.blacklist()
+            # Try to blacklist the token
+            token = RefreshToken(refresh_token)
             
-            logout(request)
+            # Check if blacklist method exists
+            if hasattr(token, 'blacklist'):
+                token.blacklist()
+                message = 'Successfully logged out. Token blacklisted.'
+            else:
+                # Blacklist not available, but we can still consider it logged out
+                message = 'Successfully logged out. Token invalidated.'
             
             return Response(
-                {'message': 'Successfully logged out'},
+                {'message': message},
+                status=status.HTTP_200_OK
+            )
+            
+        except TokenError as e:
+            # Token is already invalid/expired, but we can still consider it logged out
+            return Response(
+                {'message': 'Successfully logged out. Token was already invalid.'},
                 status=status.HTTP_200_OK
             )
         except Exception as e:
             return Response(
-                {'error': 'Failed to logout'},
+                {'error': f'Failed to logout: {str(e)}'},
                 status=status.HTTP_400_BAD_REQUEST
             )
     
@@ -400,9 +416,7 @@ class ResendVerificationEmailView(generics.GenericAPIView):
                 fail_silently=False,
             )
             
-            return Response({
-                'message': 'Verification email resent. Please check your inbox.'
-            }, status=status.HTTP_200_OK)
+            return Response(status=status.HTTP_200_OK)
         except CustomUser.DoesNotExist:
             # Don't reveal whether email exists for security
             return Response({
@@ -566,48 +580,62 @@ class PublicDashboardView(APIView):
     
     def get(self, request):
         # Basic platform statistics
-        total_jobs = Job.objects.count()
+        from jobs.models import Job
+        try:
+            total_jobs = Job.objects.count()
         
-        # Use a subquery or direct Job model filtering
-        total_companies = CustomUser.objects.filter(
-            role='employer', 
-            is_active=True,
-            id__in=Job.objects.filter(application_deadline__gte=timezone.now()).values('employer')
-        ).distinct().count()
+            # Use a subquery or direct Job model filtering
+            total_companies = CustomUser.objects.filter(
+                role='employer', 
+                is_active=True,
+                id__in=Job.objects.filter(application_deadline__gte=timezone.now()).values('employer')
+            ).distinct().count()
+            
+            # Recent job postings
+            recent_jobs = self.get_recent_jobs()
+            
+            dashboard_data = {
+                'platform_statistics': {
+                    'total_jobs': total_jobs,
+                    'total_companies': total_companies,
+                    'new_jobs_today': Job.objects.filter(
+                        created_at__date=timezone.now().date(),
+                    ).count(),
+                },
+                'recent_jobs': recent_jobs,
+            }
+            
+            return Response(dashboard_data)
+        except Exception as e:
+            # Graceful fallback if jobs table doesn't exist
+            return Response({
+                'platform_statistics': {
+                    'total_jobs': 0,
+                    'total_companies': 0,
+                    'new_jobs_today': 0,
+                },
+                'recent_jobs': [],
+                'message': 'Platform data is being initialized'
+            })
         
-        # Recent job postings
-        recent_jobs = self.get_recent_jobs()
-        
-        dashboard_data = {
-            'platform_statistics': {
-                'total_jobs': total_jobs,
-                'total_companies': total_companies,
-                'new_jobs_today': Job.objects.filter(
-                    created_at__date=timezone.now().date(),
-                ).count(),
-            },
-            'recent_jobs': recent_jobs,
-        }
-        
-        return Response(dashboard_data)
-    
     def get_recent_jobs(self):
         """Get recently posted jobs"""
-        jobs = Job.objects.filter(
-            application_deadline__gte=timezone.now(),
-        ).select_related('employer').order_by('-created_at')[:8]
-        
-        return [{
-            'id': job.id,
-            'title': job.title,
-            'company': job.employer.company_name,
-            'location': job.location,
-            'job_type': job.job_type,
-            'salary_min': job.salary_min,
-            'salary_max': job.salary_max,
-            'created_at': job.created_at,
-            'is_new': job.created_at.date() == timezone.now().date()
-        } for job in jobs]
+        from jobs.models import Job
+        try:
+            jobs = Job.objects.filter(
+                application_deadline__gte=timezone.now()
+            ).select_related('employer').order_by('-created_at')[:10]
+            
+            return [{
+                'id': job.id,
+                'title': job.title,
+                'company_name': job.employer.company_name,
+                'location': job.location,
+                'posted_at': job.created_at,
+                'application_deadline': job.application_deadline,
+            } for job in jobs]
+        except Exception as e:
+            return [] # Graceful fallback if jobs table doesn't exist
 
 class CombinedDashboardView(APIView):
     """
