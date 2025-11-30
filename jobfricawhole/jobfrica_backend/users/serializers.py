@@ -20,13 +20,17 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         required=True,
         style={'input_type': 'password'}
     )
+    role = serializers.ChoiceField(
+        choices=[('job_seeker', 'Job Seeker'), ('employer', 'Employer')],
+        default='job_seeker'
+    )
     email = serializers.EmailField(required=True)
 
     class Meta:
         model = CustomUser
         fields = (
             'id', 'first_name', 'last_name', 'username', 
-            'email', 'password', 'password_confirm',  # Fixed field name
+            'email', 'password', 'password_confirm', 'role',  # Fixed field name
             'company_name', 'phone_number'
         )
         read_only_fields = ('id',)
@@ -77,12 +81,23 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         # Remove password_confirm as it's not a model field
         validated_data.pop('password_confirm', None)
         password = validated_data.pop('password')
+
+        original_role = validated_data.get('role', 'job_seeker')
         
         # make employer and jobseeker the only roles during registration
-        role = validated_data.get('role', 'job_seeker')
+        role = original_role
         if role not in ['job_seeker', 'employer']:
             role = 'job_seeker'
+        
         validated_data['role'] = role
+        
+        # Clear company name for job seekers
+        if role != 'employer':
+            validated_data['company_name'] = ''
+        else:
+            if 'company_name' not in validated_data or not validated_data['company_name']:
+                validated_data['company_name'] = 'N/A'
+        
         user = CustomUser.objects.create(**validated_data)
         
         # Set password properly
@@ -269,7 +284,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 {
                     'id': app.id,
                     'job_title': app.job.title,
-                    'company': app.job.company_name,
+                    'company': app.job.company,
                     'status': app.status,
                     'applied_at': app.applied_at
                 }
@@ -296,7 +311,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 {
                     'id': job.id,
                     'title': job.title,
-                    'status': job.status,
+                    'company': job.company,
                     'applications_count': job.applications.count()
                 }
                 for job in recent
